@@ -5,6 +5,7 @@
  * Copyright (C) 2021-2025  Frédéric France		<frederic.france@free.fr>
  * Copyright (C) 2024-2025	MDW					<mdeweerd@users.noreply.github.com>
  * Copyright (C) 2026		Alexandre Spangaro	<alexandre@inovea-conseil.com>
+ * Copyright (C) 2026 		Juan Pablo Farber	<jpfarber@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -306,16 +307,108 @@ class Import
 
 	// phpcs:disable PEAR.NamingConventions.ValidFunctionName.ScopeNotCamelCaps
 	/**
-	 *  Build an import example file.
-	 *  Arrays this->array_export_xxx are already loaded for required datatoexport
+	 *  Detect dictionary tables referenced by import fields.
+	 *  Scans example values and regex patterns to find tables that provide
+	 *  valid values for foreign-key fields, so they can be included as
+	 *  reference sheets in the example file.
 	 *
-	 *  @param      string		$model              Name of import engine ('csv', ...)
-	 *  @param      string[]	$headerlinefields   Array of values for first line of example file
-	 *  @param      string[]	$contentlinevalues	Array of values for content line of example file
-	 *  @param		string		$datatoimport		Dataset to import
-	 *  @return		string							Return integer <0 if KO, >0 if OK
+	 *  Detection uses four sources (in order):
+	 *   1. Example value text containing: in table "llx_tablename"
+	 *   2. Regex patterns of the form: fieldname@llx_tablename
+	 *   3. Convert-value rules with a 'table_element' or 'element' key
+	 *   4. Heuristic: fields named fk_XXX → tries llx_c_XXX then llx_XXX
+	 *
+	 *  @param  array<string,string>				$array_import_examplevalues		Example values keyed by field code
+	 *  @param  array<string,string>				$array_import_regex				Regex patterns keyed by field code
+	 *  @param  array<string,string>				$array_import_fields			Field labels keyed by field code
+	 *  @param  array<string,array<string,string>>	$array_import_convertvalue		Convert-value rules keyed by field code
+	 *  @return array<string,string>												Array [full_table_name => short_name]
 	 */
-	public function build_example_file($model, $headerlinefields, $contentlinevalues, $datatoimport)
+	public function getRelatedTables($array_import_examplevalues, $array_import_regex, $array_import_fields, $array_import_convertvalue = array())
+	{
+		// phpcs:enable
+		$reftables = array();
+
+		// Source 1: example values containing: in table "llx_tablename"
+		foreach ($array_import_examplevalues as $exampleval) {
+			preg_match_all('/in table "('.preg_quote(MAIN_DB_PREFIX, '/').'([^"]+))"/', $exampleval, $matches, PREG_SET_ORDER);
+			foreach ($matches as $m) {
+				if (!isset($reftables[$m[1]])) {
+					$reftables[$m[1]] = $m[2];
+				}
+			}
+		}
+
+		// Source 2: regex patterns of the form fieldname@llx_tablename
+		foreach ($array_import_regex as $regex) {
+			if (preg_match('/^[^@]+@('.preg_quote(MAIN_DB_PREFIX, '/').'([^@]+))$/', $regex, $m)) {
+				if (!isset($reftables[$m[1]])) {
+					$reftables[$m[1]] = $m[2];
+				}
+			}
+		}
+
+		// Source 3: convert-value rules with explicit 'table_element' or 'element' key
+		// e.g. fk_account → element='BankAccount' → llx_bank_account
+		foreach ($array_import_convertvalue as $rule) {
+			if (!is_array($rule)) {
+				continue;
+			}
+			// Prefer 'table_element' (exact table name without prefix), fall back to 'element'
+			$tablekey = '';
+			if (!empty($rule['table_element'])) {
+				$tablekey = $rule['table_element'];
+			} elseif (!empty($rule['element'])) {
+				// Convert CamelCase element name to snake_case table name
+				// e.g. BankAccount → bank_account
+				$tablekey = strtolower(preg_replace('/(?<!^)[A-Z]/', '_$0', $rule['element']));
+			}
+			if ($tablekey) {
+				$fulltable = MAIN_DB_PREFIX.$tablekey;
+				if (!isset($reftables[$fulltable]) && $this->db->DDLDescTable($fulltable)) {
+					$reftables[$fulltable] = $tablekey;
+				}
+			}
+		}
+
+		// Source 4: heuristic for fk_XXX fields not yet resolved
+		// Tries llx_c_XXX first (most dictionaries), then llx_XXX
+		foreach (array_keys($array_import_fields) as $code) {
+			$parts = explode('.', $code, 2);
+			if (count($parts) !== 2 || strpos($parts[1], 'fk_') !== 0) {
+				continue;
+			}
+			$fname = substr($parts[1], 3); // strip 'fk_'
+			foreach (array(MAIN_DB_PREFIX.'c_'.$fname, MAIN_DB_PREFIX.$fname) as $candidate) {
+				if (isset($reftables[$candidate])) {
+					break; // already found
+				}
+				if ($this->db->DDLDescTable($candidate)) {
+					$reftables[$candidate] = substr($candidate, strlen(MAIN_DB_PREFIX));
+					break;
+				}
+			}
+		}
+
+		return $reftables;
+	}
+
+	// phpcs:disable PEAR.NamingConventions.ValidFunctionName.ScopeNotCamelCaps
+	/**
+	 *  Build an import example file.
+	 *  Arrays this->array_export_xxx are already loaded for required datatoexport.
+	 *  When $relatedtables is provided and the format supports multiple sheets (xlsx),
+	 *  one additional sheet is added per referenced dictionary table so users can
+	 *  look up valid values for foreign-key fields directly in the file.
+	 *
+	 *  @param      string					$model              Name of import engine ('csv', ...)
+	 *  @param      string[]				$headerlinefields   Array of values for first line of example file
+	 *  @param      string[]				$contentlinevalues	Array of values for content line of example file
+	 *  @param		string					$datatoimport		Dataset to import
+	 *  @param		array<string,string>	$relatedtables		Optional: [full_table_name => short_name] from getRelatedTables()
+	 *  @return		string								        Output string (or empty string for xlsx which writes a file)
+	 */
+	public function build_example_file($model, $headerlinefields, $contentlinevalues, $datatoimport, $relatedtables = array())
 	{
 		// phpcs:enable
 		global $conf, $langs;
@@ -343,6 +436,51 @@ class Import
 
 		// Generate record line
 		$s .= $objmodel->write_record_example($outputlangs, $contentlinevalues);
+
+		// Add one sheet per related dictionary table (xlsx only)
+		if (!empty($relatedtables) && $model === 'xlsx' && !empty($objmodel->workbook)) {
+			foreach ($relatedtables as $fulltable => $shorttable) {
+				$resql = $this->db->query("SELECT * FROM ".$fulltable." ORDER BY 1 ASC");
+				if (!$resql) {
+					continue;
+				}
+				// Sheet title is limited to 31 chars in Excel
+				$sheet = $objmodel->workbook->createSheet();
+				$sheet->setTitle(substr($shorttable, 0, 31));
+
+				// Get column names from table structure
+				$resqlcols = $this->db->DDLDescTable($fulltable);
+				$columns = array();
+				if ($resqlcols) {
+					while ($objcol = $this->db->fetch_object($resqlcols)) {
+						$columns[] = $objcol->Field;
+					}
+				}
+
+				// Write bold column headers
+				$col = 1;
+				foreach ($columns as $colname) {
+					$sheet->getStyleByColumnAndRow($col, 1)->getFont()->setBold(true);
+					$sheet->SetCellValueByColumnAndRow($col, 1, $colname);
+					$col++;
+				}
+
+				// Write all data rows
+				$rownum = 2;
+				while ($row = $this->db->fetch_object($resql)) {
+					$col = 1;
+					foreach ($columns as $colname) {
+						$sheet->SetCellValueByColumnAndRow($col, $rownum, $row->$colname);
+						$col++;
+					}
+					$rownum++;
+				}
+
+				$this->db->free($resql);
+			}
+			// Return focus to the main import sheet
+			$objmodel->workbook->setActiveSheetIndex(0);
+		}
 
 		// Generate footer
 		$s .= $objmodel->write_footer_example($outputlangs);

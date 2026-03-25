@@ -2,6 +2,7 @@
 /* Copyright (C) 2009-2010 Laurent Destailleur  <eldy@users.sourceforge.net>
  * Copyright (C) 2024       Frédéric France             <frederic.france@free.fr>
  * Copyright (C) 2025		MDW							<mdeweerd@users.noreply.github.com>
+ * Copyright (C) 2026 		Juan Pablo Farber			<jpfarber@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -109,6 +110,17 @@ $objimport->load_arrays($user, $datatoimport);
 $fieldstarget = $objimport->array_import_fields[0];
 $valuestarget = $objimport->array_import_examplevalues[0];
 
+// Detect dictionary tables referenced by the import fields (for related-table sheets in xlsx)
+$relatedtables = array();
+if ($format === 'xlsx') {
+	$relatedtables = $objimport->getRelatedTables(
+		isset($objimport->array_import_examplevalues[0]) ? $objimport->array_import_examplevalues[0] : array(),
+		isset($objimport->array_import_regex[0]) ? $objimport->array_import_regex[0] : array(),
+		isset($objimport->array_import_fields[0]) ? $objimport->array_import_fields[0] : array(),
+		isset($objimport->array_import_convertvalue[0]) ? $objimport->array_import_convertvalue[0] : array()
+	);
+}
+
 $attachment = true;
 if (GETPOSTISSET("attachment")) {
 	$attachment = GETPOST("attachment");
@@ -141,4 +153,4 @@ foreach ($fieldstarget as $code => $label) {
 //var_dump($headerlinefields);
 //var_dump($contentlinevalues);
 
-print $objimport->build_example_file($format, $headerlinefields, $contentlinevalues, $datatoimport);
+print $objimport->build_example_file($format, $headerlinefields, $contentlinevalues, $datatoimport, $relatedtables);
